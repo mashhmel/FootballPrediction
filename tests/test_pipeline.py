@@ -8,7 +8,7 @@ import pytest
 
 from src.evaluate import brier, evaluate, rps, split
 from src.features import SETUPS, build_features
-from src.poisson import outcome_probs_from_grid, scoreline_grid, walk_forward_probs
+from src.poisson import dc_tau, outcome_probs_from_grid, scoreline_grid, walk_forward_probs
 from tests.fake_data import make_fake_matches
 
 
@@ -117,3 +117,59 @@ def test_models_run(features):
         assert P.shape == (len(val), 3)
         assert np.allclose(P.sum(axis=1), 1)
         assert evaluate(val.label, P)["accuracy"] > 0.33   # better than random on fake data
+
+
+# ---- Dixon-Coles -------------------------------------------------------------------------
+def test_dixon_coles_grid():
+    plain = scoreline_grid(1.4, 1.1)
+    dc = scoreline_grid(1.4, 1.1, rho=-0.1)
+    assert dc.sum() == pytest.approx(1.0)
+    assert dc[0, 0] > plain[0, 0] and dc[1, 1] > plain[1, 1]     # negative rho: more 0-0, 1-1
+    assert dc[1, 0] < plain[1, 0] and dc[0, 1] < plain[0, 1]
+    assert np.allclose(dc_tau(2, 3, 1.4, 1.1, -0.1), 1.0)         # high scores untouched
+
+
+def test_dixon_coles_walk_forward(matches):
+    sub = matches[matches.season.isin(["2122", "2223", "2324"])]
+    p = walk_forward_probs(sub, xi=0.0019, dixon_coles=True, min_train=200)
+    ok = p.dropna(subset=["pois_pH"])
+    assert len(ok) > 0
+    assert np.allclose(ok[["pois_pH", "pois_pD", "pois_pA"]].sum(axis=1), 1)
+    assert ok["pois_rho"].between(-0.2, 0.2).all()
+
+
+# ---- final-test guard, bootstrap, fixture prediction ---------------------------------------
+def test_bootstrap_identical_is_zero(features):
+    from src.analysis import bootstrap_diff
+    y = features.label.values[:300]
+    P = np.tile([0.45, 0.25, 0.30], (300, 1))
+    r = bootstrap_diff(y, P, P, n=200)
+    assert r["diff"] == 0 and not r["clear"]
+
+
+def test_final_test_refuses_second_run(features, tmp_path):
+    import pandas as pd
+    from src.models import run_final_test
+    from src.poisson import fill_missing_probs
+    f = features.copy()
+    f["pois_pH"], f["pois_pD"], f["pois_pA"] = 0.45, 0.25, 0.30
+    tuned = pd.DataFrame([{"model": "LR", "setup": "A", "params": {"C": 0.1}}])
+    run_final_test(f, tuned, SETUPS, out_dir=tmp_path)
+    with pytest.raises(RuntimeError):
+        run_final_test(f, tuned, SETUPS, out_dir=tmp_path)
+
+
+def test_fixture_features_ignore_dummy_result(matches):
+    """The made-up result of a future fixture must not change its own features."""
+    import pandas as pd
+    from src.features import build_features
+    home, away = matches.home.iloc[-1], matches.away.iloc[-1]
+    date = matches.date.max() + pd.Timedelta(days=7)
+    rows = []
+    for res, hg, ag in [("D", 0, 0), ("H", 5, 0)]:
+        d = {c: np.nan for c in matches.columns}
+        d.update({"match_id": 99999, "season": matches.season.max(), "date": date, "home": home,
+                  "away": away, "hg": hg, "ag": ag, "result": res, "label": 1, "hst": 0, "ast": 0})
+        f = build_features(pd.concat([matches, pd.DataFrame([d])], ignore_index=True))
+        rows.append(f.loc[f.match_id == 99999, SETUPS["C"]].to_numpy())
+    assert np.allclose(rows[0], rows[1], equal_nan=True)

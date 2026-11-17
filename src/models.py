@@ -67,3 +67,117 @@ def final_test(df, name, cols, **params):
     train, val, test = split(df)
     model, P = fit_predict(name, pd.concat([train, val]), test, cols, **params)
     return model, P, evaluate(test.label, P)
+
+
+# ---- 5-season rolling validation (more reliable than one season) -------------------------
+ROLLING_SEASONS = ["1819", "1920", "2021", "2122", "2223"]
+
+
+def rolling_eval(df, name, cols, params=None, seasons=ROLLING_SEASONS):
+    """For each season: train on every earlier training season (from 2010/11), predict it.
+    Returns metrics over all predicted matches (~1,900). Test seasons are never touched."""
+    import numpy as np
+    Ps, ys = [], []
+    for vs in seasons:
+        tr = df[(df.season >= "1011") & (df.season < vs)]
+        te = df[df.season == vs]
+        _, P = fit_predict(name, tr, te, cols, **(params or {}))
+        Ps.append(P)
+        ys.append(te["label"].to_numpy())
+    return evaluate(np.concatenate(ys), np.vstack(Ps))
+
+
+def rolling_validation(df, setups, models=("LR", "RF", "XGB")):
+    """Default settings for every model x setup, scored on the 5 rolling seasons."""
+    rows = [{"model": n, "setup": s, **rolling_eval(df, n, cols)}
+            for s, cols in setups.items() for n in models]
+    return pd.DataFrame(rows)
+
+
+EXTRA_GRIDS = {   # used when the best setting sat at the edge of GRIDS
+    "LR": [{"C": c} for c in (0.001, 0.003)],
+    "XGB": [{"max_depth": d, "learning_rate": 0.01, "n_estimators": n, "subsample": 0.8}
+            for d in (1, 2) for n in (300, 600)],
+}
+
+
+def tune_rolling(df, setups, models=("LR", "RF", "XGB"), grids=None, extra=True, verbose=True):
+    """Pick the best settings for every model x setup by rolling-validation RPS.
+    Returns one row per model x setup: model, setup, params, metrics."""
+    grids = grids or GRIDS
+    best = []
+    for s, cols in setups.items():
+        for name in models:
+            grid = list(grids[name]) + (EXTRA_GRIDS.get(name, []) if extra else [])
+            trials = [{"params": p, **rolling_eval(df, name, cols, p)} for p in grid]
+            top = min(trials, key=lambda r: r["rps"])
+            best.append({"model": name, "setup": s, **top})
+            if verbose:
+                print(name, s, top["params"], top["rps"])
+    return pd.DataFrame(best)
+
+
+def load_tuned(path="results/tuning_results.csv"):
+    """Reload saved tuning results (params come back from text to dicts)."""
+    import ast
+    t = pd.read_csv(path)
+    t["params"] = t["params"].apply(lambda p: p if isinstance(p, dict) else ast.literal_eval(p))
+    return t
+
+
+# ---- FINAL TEST (run once) -------------------------------------------------------------------
+def run_final_test(df, tuned, setups, out_dir="results", force=False):
+    """Train every tuned model on 2010/11-2022/23, score ONCE on 2023/24-2024/25.
+
+    Refuses to run again if results/results_table.csv already exists (protects the
+    "test once" rule). Re-running with identical settings gives identical numbers, so
+    force=True is only for reproducing after a crash/restart - never for trying new settings.
+    Saves: results_table.csv, test_predictions.npz, models/<model>_<setup>.joblib
+    """
+    from pathlib import Path
+    import joblib
+    import numpy as np
+    from src.evaluate import always_home, bookmaker_probs, frequencies
+    out = Path(out_dir)
+    table_path = out / "results_table.csv"
+    if table_path.exists() and not force:
+        raise RuntimeError(f"{table_path} already exists - the final test has been run. "
+                           "Use force=True ONLY to reproduce it with the same settings.")
+    (out / "models").mkdir(parents=True, exist_ok=True)
+    train, val, test = split(df)
+    rows, preds = [], {}
+    for r in tuned.to_dict("records"):
+        model, P, scores = final_test(df, r["model"], setups[r["setup"]], **r["params"])
+        rows.append({"model": r["model"], "setup": r["setup"], **scores, "params": str(r["params"])})
+        preds[f"{r['model']}_{r['setup']}"] = P
+        joblib.dump(model, out / "models" / f"{r['model']}_{r['setup']}.joblib")
+    P_pois = test[["pois_pH", "pois_pD", "pois_pA"]].to_numpy()
+    P_book = bookmaker_probs(test)
+    P_freq = frequencies(pd.concat([train, val])["label"], len(test))
+    for name, P in [("Poisson (Dixon-Coles)", P_pois), ("Bookmaker (Bet365)", P_book),
+                    ("Frequencies", P_freq), ("Always home", always_home(len(test)))]:
+        rows.append({"model": name, "setup": "-", **evaluate(test["label"], P), "params": ""})
+        preds[name] = P
+    table = pd.DataFrame(rows)
+    table.to_csv(table_path, index=False)
+    np.savez(out / "test_predictions.npz", labels=test["label"].to_numpy(),
+             match_id=test["match_id"].to_numpy(), **preds)
+    return table
+
+
+def extend_tuning(df, tuned, setups, extra=None, verbose=True):
+    """Try EXTRA_GRIDS on top of already-saved tuning; keep whichever is better.
+    Safe to run more than once (only ever replaces a setting with a better one)."""
+    extra = extra or EXTRA_GRIDS
+    rows = []
+    for r in tuned.to_dict("records"):
+        for p in extra.get(r["model"], []):
+            if p == r["params"]:
+                continue
+            sc = rolling_eval(df, r["model"], setups[r["setup"]], p)
+            if sc["rps"] < r["rps"]:
+                if verbose:
+                    print(f"{r['model']} {r['setup']}: {r['params']} -> {p}  rps {r['rps']} -> {sc['rps']}")
+                r = {**r, "params": p, **sc}
+        rows.append(r)
+    return pd.DataFrame(rows)
